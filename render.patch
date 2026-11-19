@@ -1,0 +1,304 @@
+diff --git a/app/api/amazon-data/route.ts b/app/api/amazon-data/route.ts
+index 019f91e..7773487 100644
+--- a/app/api/amazon-data/route.ts
++++ b/app/api/amazon-data/route.ts
+@@ -1,8 +1,9 @@
+ import { NextRequest, NextResponse } from 'next/server';
++import { MOCK_POD_PRODUCTS } from '@/lib/mockData';
+ import { AmazonProduct, BsrHistoryPoint, ExtractedKeyword, ProductType } from '@/types/amazon';
+ 
+ const RAPIDAPI_HOST = 'real-time-amazon-data.p.rapidapi.com';
+-const RAPIDAPI_KEY = process.env.RAPIDAPI_KEY || '110cfe6ccdmsh585217d3b968239p18b55ajsn62402351c62d';
++const RAPIDAPI_KEY = process.env.RAPIDAPI_KEY?.trim();
+ const BASE_URL = 'https://real-time-amazon-data.p.rapidapi.com';
+ 
+ // Clean ASIN extractor
+@@ -378,14 +379,23 @@ export async function POST(req: NextRequest) {
+   try {
+     const body = await req.json();
+     const { action, payload, simulateFailover } = body;
++    const mockMode = body.mockMode === true;
++    if (!mockMode && !simulateFailover && !RAPIDAPI_KEY) {
++      const message = 'Set RAPIDAPI_KEY in .env.local for live searches, or enable Mock Data Mode.';
++      return NextResponse.json({ success: false, message, error: message }, { status: 503 });
++    }
+ 
+     const headers = {
+       'x-rapidapi-host': RAPIDAPI_HOST,
+-      'x-rapidapi-key': RAPIDAPI_KEY,
++      'x-rapidapi-key': RAPIDAPI_KEY ?? '',
+     };
+ 
+     // 1. ACTION: Test Provider Connectivity
+     if (action === 'test-provider') {
++      if (mockMode) {
++        return NextResponse.json({ success: true, isMock: true, latencyMs: 0 });
++      }
++
+       const pingUrl = `${BASE_URL}/product-details?asin=B07ZPKBL9V&country=US`;
+       const res = await fetch(pingUrl, {
+         method: 'GET',
+@@ -434,6 +444,21 @@ export async function POST(req: NextRequest) {
+         });
+       }
+ 
++      if (mockMode) {
++        const data = MOCK_POD_PRODUCTS.find(product => product.asin === cleanAsin);
++        if (!data) {
++          return NextResponse.json({ success: false, error: 'This ASIN is not in the sample dataset.' }, { status: 404 });
++        }
++        return NextResponse.json({
++          success: true,
++          data,
++          providerUsed: 'Mock Data',
++          isMock: true,
++          fallbackOccurred: false,
++          latencyMs: Date.now() - startTime,
++        });
++      }
++
+       // Direct HTTP GET request to https://real-time-amazon-data.p.rapidapi.com/product-details
+       const endpoint = `${BASE_URL}/product-details?asin=${encodeURIComponent(cleanAsin)}&country=US`;
+       const res = await fetch(endpoint, {
+@@ -482,30 +507,31 @@ export async function POST(req: NextRequest) {
+ 
+       // Concurrently fetch page 1 & page 2 to ensure a deep pool of Merch candidates
+       const fetchTrendPage = async (page: number) => {
+-        try {
+-          const url = `${BASE_URL}/search?query=${encodeURIComponent(finalQuery)}&country=US${categoryParam}&page=${page}`;
+-          const r = await fetch(url, { method: 'GET', headers, signal: AbortSignal.timeout(12000) });
+-          if (!r.ok) return [];
+-          const j = await r.json();
+-          return j.data?.products || (Array.isArray(j.data) ? j.data : []);
+-        } catch {
+-          return [];
+-        }
++        const url = `${BASE_URL}/search?query=${encodeURIComponent(finalQuery)}&country=US${categoryParam}&page=${page}`;
++        const r = await fetch(url, { method: 'GET', headers, signal: AbortSignal.timeout(12000) });
++        if (!r.ok) throw new Error(`RapidAPI search returned HTTP ${r.status}.`);
++        const j = await r.json();
++        return j.data?.products || (Array.isArray(j.data) ? j.data : []);
+       };
+ 
+-      const [p1, p2] = await Promise.all([fetchTrendPage(1), fetchTrendPage(2)]);
+-      const rawProducts: any[] = [...p1, ...p2];
+-
+-      // 2. Strict Backend Result Filtering:
+-      // a. Title terms (T-Shirt, Premium T-Shirt, Tank Top, V-Neck T-Shirt)
+-      // b. Exclude known commercial non-merch brands (Nike, Adidas, Gildan, Hanes, etc.)
+-      // c. Exclude non-apparel items (Cases, Mugs, Pillows, PopSockets, Stickers, Books)
+-      // d. Price Range Guardrail ($13.00 to $25.99)
+-      const filteredRaw = merchOnly
+-        ? rawProducts.filter((item: any) => isStrictMerchTShirt(item))
+-        : rawProducts;
+-
+-      let mappedList: AmazonProduct[] = filteredRaw.map(mapSearchItemToModel);
++      let mappedList: AmazonProduct[];
++      if (mockMode) {
++        const term = keyword.trim().toLowerCase();
++        mappedList = MOCK_POD_PRODUCTS.filter(product =>
++          (!merchOnly || product.productType.endsWith('T-Shirt')) &&
++          product.title.toLowerCase().includes(term)
++        );
++      } else {
++        const pages = await Promise.allSettled([fetchTrendPage(1), fetchTrendPage(2)]);
++        const successfulPages = pages.filter(page => page.status === 'fulfilled');
++        if (successfulPages.length === 0) {
++          const failure = pages.find(page => page.status === 'rejected');
++          throw failure?.reason;
++        }
++        const rawProducts = successfulPages.flatMap(page => page.value);
++        const filteredRaw = merchOnly ? rawProducts.filter(isStrictMerchTShirt) : rawProducts;
++        mappedList = filteredRaw.map(mapSearchItemToModel);
++      }
+ 
+       // Apply productType filter if not 'all'
+       if (productType && productType !== 'all') {
+@@ -537,7 +563,8 @@ export async function POST(req: NextRequest) {
+         query: finalQuery,
+         merchOnly,
+         category: merchOnly ? 'fashion' : 'all',
+-        providerUsed: 'real-time-amazon-data.p.rapidapi.com/search',
++        providerUsed: mockMode ? 'Mock Data' : 'real-time-amazon-data.p.rapidapi.com/search',
++        isMock: mockMode,
+         fallbackOccurred: false,
+         latencyMs: Date.now() - startTime,
+       });
+@@ -560,30 +587,31 @@ export async function POST(req: NextRequest) {
+ 
+       // Concurrently fetch page 1 & page 2 to ensure a deep pool of Merch candidates
+       const fetchEvergreenPage = async (page: number) => {
+-        try {
+-          const url = `${BASE_URL}/search?query=${encodeURIComponent(finalQuery)}&country=US${categoryParam}&page=${page}`;
+-          const r = await fetch(url, { method: 'GET', headers, signal: AbortSignal.timeout(12000) });
+-          if (!r.ok) return [];
+-          const j = await r.json();
+-          return j.data?.products || (Array.isArray(j.data) ? j.data : []);
+-        } catch {
+-          return [];
+-        }
++        const url = `${BASE_URL}/search?query=${encodeURIComponent(finalQuery)}&country=US${categoryParam}&page=${page}`;
++        const r = await fetch(url, { method: 'GET', headers, signal: AbortSignal.timeout(12000) });
++        if (!r.ok) throw new Error(`RapidAPI search returned HTTP ${r.status}.`);
++        const j = await r.json();
++        return j.data?.products || (Array.isArray(j.data) ? j.data : []);
+       };
+ 
+-      const [p1, p2] = await Promise.all([fetchEvergreenPage(1), fetchEvergreenPage(2)]);
+-      const rawProducts: any[] = [...p1, ...p2];
+-
+-      // 2. Strict Backend Result Filtering:
+-      // a. Title terms (T-Shirt, Premium T-Shirt, Tank Top, V-Neck T-Shirt)
+-      // b. Exclude known commercial non-merch brands (Nike, Adidas, Gildan, Hanes, etc.)
+-      // c. Exclude non-apparel items (Cases, Mugs, Pillows, PopSockets, Stickers, Books)
+-      // d. Price Range Guardrail ($13.00 to $25.99)
+-      const filteredRaw = merchOnly
+-        ? rawProducts.filter((item: any) => isStrictMerchTShirt(item))
+-        : rawProducts;
+-
+-      let mappedList: AmazonProduct[] = filteredRaw.map(mapSearchItemToModel);
++      let mappedList: AmazonProduct[];
++      if (mockMode) {
++        const term = keyword.trim().toLowerCase();
++        mappedList = MOCK_POD_PRODUCTS.filter(product =>
++          (!merchOnly || product.productType.endsWith('T-Shirt')) &&
++          product.title.toLowerCase().includes(term)
++        );
++      } else {
++        const pages = await Promise.allSettled([fetchEvergreenPage(1), fetchEvergreenPage(2)]);
++        const successfulPages = pages.filter(page => page.status === 'fulfilled');
++        if (successfulPages.length === 0) {
++          const failure = pages.find(page => page.status === 'rejected');
++          throw failure?.reason;
++        }
++        const rawProducts = successfulPages.flatMap(page => page.value);
++        const filteredRaw = merchOnly ? rawProducts.filter(isStrictMerchTShirt) : rawProducts;
++        mappedList = filteredRaw.map(mapSearchItemToModel);
++      }
+ 
+       // Filter by max reviews if specified
+       if (maxReviews) {
+@@ -618,7 +646,8 @@ export async function POST(req: NextRequest) {
+         query: finalQuery,
+         merchOnly,
+         category: merchOnly ? 'fashion' : 'all',
+-        providerUsed: 'real-time-amazon-data.p.rapidapi.com/search',
++        providerUsed: mockMode ? 'Mock Data' : 'real-time-amazon-data.p.rapidapi.com/search',
++        isMock: mockMode,
+         fallbackOccurred: false,
+         latencyMs: Date.now() - startTime,
+       });
+diff --git a/context/ApiContext.tsx b/context/ApiContext.tsx
+index bc49fa4..b6814a4 100644
+--- a/context/ApiContext.tsx
++++ b/context/ApiContext.tsx
+@@ -160,7 +160,7 @@ export function ApiProvider({ children }: { children: React.ReactNode }) {
+           latencyMs: json.latencyMs,
+           lastTested: 'Just now',
+         });
+-        toast.success(`Connected to ${provider.name} (${json.latencyMs}ms)`, { id: toastId });
++        toast.success(json.isMock ? 'Mock Data Mode is active.' : `Connected to ${provider.name} (${json.latencyMs}ms)`, { id: toastId });
+       } else if (res.status === 429) {
+         updateProvider(provider.id, {
+           status: 'rate-limited',
+@@ -233,7 +233,7 @@ export function ApiProvider({ children }: { children: React.ReactNode }) {
+     const cacheKey = `asin:${cleanAsin}`;
+ 
+     // 1. Persistent Storage Check: return cached product immediately if present
+-    if (!forceRefresh) {
++    if (!forceRefresh && !mockMode) {
+       const cached = getCachedItem<AmazonProduct>(cacheKey);
+       if (cached && cached.data) {
+         return {
+@@ -268,8 +268,10 @@ export function ApiProvider({ children }: { children: React.ReactNode }) {
+ 
+       if (json.success && json.data) {
+         // Save to persistent storage
+-        setCachedItem(cacheKey, json.data, 'asin', 1);
+-        setCacheStats(getRapidApiCacheStats());
++        if (!mockMode) {
++          setCachedItem(cacheKey, json.data, 'asin', 1);
++          setCacheStats(getRapidApiCacheStats());
++        }
+         return {
+           ...json.data,
+           isFromCache: false,
+@@ -288,7 +290,7 @@ export function ApiProvider({ children }: { children: React.ReactNode }) {
+     const cacheKey = generateFilterCacheKey('trend', { ...filters, merchOnly });
+ 
+     // 1. Persistent Storage Check: return cached results immediately
+-    if (!forceRefresh) {
++    if (!forceRefresh && !mockMode) {
+       const cached = getCachedItem<AmazonProduct[]>(cacheKey);
+       if (cached && Array.isArray(cached.data) && cached.data.length > 0) {
+         return cached.data.map((p) => ({
+@@ -312,9 +314,13 @@ export function ApiProvider({ children }: { children: React.ReactNode }) {
+         }),
+       });
+       const json = await res.json();
++      if (!res.ok) {
++        toast.error(json.error || 'Amazon data request failed.');
++        return [];
++      }
+       const list = json.data || [];
+ 
+-      if (list.length > 0) {
++      if (!mockMode && list.length > 0) {
+         // Save to persistent storage
+         setCachedItem(cacheKey, list, 'trend', list.length);
+         setCacheStats(getRapidApiCacheStats());
+@@ -335,7 +341,7 @@ export function ApiProvider({ children }: { children: React.ReactNode }) {
+     const cacheKey = generateFilterCacheKey('evergreen', { ...filters, merchOnly });
+ 
+     // 1. Persistent Storage Check: return cached results immediately
+-    if (!forceRefresh) {
++    if (!forceRefresh && !mockMode) {
+       const cached = getCachedItem<AmazonProduct[]>(cacheKey);
+       if (cached && Array.isArray(cached.data) && cached.data.length > 0) {
+         return cached.data.map((p) => ({
+@@ -359,9 +365,13 @@ export function ApiProvider({ children }: { children: React.ReactNode }) {
+         }),
+       });
+       const json = await res.json();
++      if (!res.ok) {
++        toast.error(json.error || 'Amazon data request failed.');
++        return [];
++      }
+       const list = json.data || [];
+ 
+-      if (list.length > 0) {
++      if (!mockMode && list.length > 0) {
+         // Save to persistent storage
+         setCachedItem(cacheKey, list, 'evergreen', list.length);
+         setCacheStats(getRapidApiCacheStats());
+diff --git a/lib/mockData.ts b/lib/mockData.ts
+index be5bd1a..1d57d68 100644
+--- a/lib/mockData.ts
++++ b/lib/mockData.ts
+@@ -57,7 +57,7 @@ export const INITIAL_PROVIDERS: ProviderConfig[] = [
+     type: 'primary',
+     host: 'real-time-amazon-data.p.rapidapi.com',
+     endpointUrl: 'https://real-time-amazon-data.p.rapidapi.com/product-details',
+-    apiKey: '110cfe6ccdmsh585217d3b968239p18b55ajsn62402351c62d',
++    apiKey: '',
+     enabled: true,
+     status: 'healthy',
+     latencyMs: 142,
+@@ -69,7 +69,7 @@ export const INITIAL_PROVIDERS: ProviderConfig[] = [
+     type: 'secondary',
+     host: 'amazon-price1.p.rapidapi.com',
+     endpointUrl: 'https://amazon-price1.p.rapidapi.com/priceReport',
+-    apiKey: '110cfe6ccdmsh585217d3b968239p18b55ajsn62402351c62d',
++    apiKey: '',
+     enabled: true,
+     status: 'healthy',
+     latencyMs: 210,
+@@ -81,7 +81,7 @@ export const INITIAL_PROVIDERS: ProviderConfig[] = [
+     type: 'metadata',
+     host: 'amazon-search1.p.rapidapi.com',
+     endpointUrl: 'https://amazon-search1.p.rapidapi.com/searchSuggestions',
+-    apiKey: '110cfe6ccdmsh585217d3b968239p18b55ajsn62402351c62d',
++    apiKey: '',
+     enabled: true,
+     status: 'healthy',
+     latencyMs: 185,

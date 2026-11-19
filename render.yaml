@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: pod-rocket
+    runtime: node
+    plan: free
+    buildCommand: git apply render.patch && npm ci --no-audit --no-fund && npm run build
+    startCommand: npm run start -- --hostname 0.0.0.0
+    healthCheckPath: /
+    envVars:
+      - key: NODE_VERSION
+        value: 22
+      - key: RAPIDAPI_KEY
+        sync: false
+
